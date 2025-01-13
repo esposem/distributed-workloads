@@ -9,6 +9,8 @@ import tempfile
 import time
 import tree
 from typing import Tuple
+import s3fs
+import pyarrow
 import urllib
 from urllib.parse import urljoin
 
@@ -46,6 +48,10 @@ from utils import (
 
 urllib.parse.uses_relative.append("s3")
 urllib.parse.uses_netloc.append("s3")
+
+N_WORKERS = 1
+N_GPUS = 0
+NAMESPACE = 'fine-tuning'
 
 OPTIM_BETAS = (0.9, 0.999)
 OPTIM_EPS = 1e-8
@@ -230,10 +236,11 @@ def training_function(kwargs: dict):
 
     # Train has a bug somewhere that causes ACCELERATE_TORCH_DEVICE to not be set
     # properly on multi-gpu nodes
-    cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device_id = cuda_visible_device[local_rank]
-    os.environ["ACCELERATE_TORCH_DEVICE"] = f"cuda:{device_id}"
+    if N_GPUS > 0:
+        cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device_id = cuda_visible_device[local_rank]
+        os.environ["ACCELERATE_TORCH_DEVICE"] = f"cuda:{device_id}"
 
     config = kwargs["config"]
     args = argparse.Namespace(**kwargs["args"])
@@ -260,8 +267,10 @@ def training_function(kwargs: dict):
     batch_size = int(config["batch_size"])
     gradient_accumulation_steps = int(config["gradient_accumulation_steps"])
 
+    collate_device = "auto"
     # Get deepspeed config to set up the batch size per device
     ds_plugin = config["ds_plugin"]
+    #if N_GPUS > 0:
     ds_plugin.hf_ds_config.config["train_micro_batch_size_per_gpu"] = batch_size
 
     # Initialize accelerator
@@ -270,6 +279,7 @@ def training_function(kwargs: dict):
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=args.mx,
     )
+    collate_device = accelerator.device
 
     set_seed(seed)
 
@@ -287,7 +297,7 @@ def training_function(kwargs: dict):
         collate_fn,
         tokenizer=tokenizer,
         block_size=config["block_size"],
-        device=accelerator.device,
+        device=collate_device,
     )
 
     pretrained_path = get_pretrained_path(model_id)
@@ -299,7 +309,7 @@ def training_function(kwargs: dict):
         torch_dtype=torch.bfloat16,
         # `use_cache=True` is incompatible with gradient checkpointing.
         use_cache=False,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2" if N_GPUS > 0 else None,
     )
     print(f"Done loading model in {time.time() - s} seconds.")
 
@@ -649,6 +659,25 @@ def parse_args():
     return args
 
 
+def get_minio_run_config(args):
+    print(os.environ.get('AWS_ACCESS_KEY_ID'))
+    s3_fs = s3fs.S3FileSystem(
+        key=os.environ.get('AWS_ACCESS_KEY_ID'),
+        secret=os.environ.get('AWS_SECRET_ACCESS_KEY'), # endpoint_url = os.environ.get('AWS_S3_ENDPOINT') # http://minio.<project-name>.svc.cluster.local:9000
+        endpoint_url=f"http://minio.{NAMESPACE}.svc.cluster.local:9000"
+    )
+    custom_fs = pyarrow.fs.PyFileSystem(pyarrow.fs.FSSpecHandler(s3_fs))
+    run_config = ray.train.RunConfig(
+        storage_path=os.environ.get('AWS_S3_BUCKET'),
+        storage_filesystem=custom_fs,
+        checkpoint_config=train.CheckpointConfig(
+            num_to_keep=args.num_checkpoints_to_keep,
+            checkpoint_score_attribute="perplexity",
+            checkpoint_score_order="min",
+            ))
+    return run_config
+
+
 def main():
     args = parse_args()
 
@@ -710,18 +739,20 @@ def main():
             "chat_template": chat_template,
             "special_tokens": special_tokens,
         },
-        run_config=train.RunConfig(
-            storage_path=urljoin(args.storage_path, args.model_name),
-            checkpoint_config=train.CheckpointConfig(
-                num_to_keep=args.num_checkpoints_to_keep,
-                checkpoint_score_attribute="perplexity",
-                checkpoint_score_order="min",
-            ),
-        ),
+
+        # run_config=train.RunConfig(
+        #     storage_path=urljoin(args.storage_path, args.model_name),
+        #     checkpoint_config=train.CheckpointConfig(
+        #         num_to_keep=args.num_checkpoints_to_keep,
+        #         checkpoint_score_attribute="perplexity",
+        #         checkpoint_score_order="min",
+        #     ),
+        # ),
+        run_config=get_minio_run_config(args),
         scaling_config=train.ScalingConfig(
             num_workers=args.num_devices,
-            use_gpu=True,
-            resources_per_worker={"GPU": 1},
+            use_gpu=N_GPUS > 0,
+            resources_per_worker={"GPU": N_GPUS},
         ),
         datasets={"train": train_ds, "valid": valid_ds},
         dataset_config=ray.train.DataConfig(datasets_to_split=["train", "valid"]),
